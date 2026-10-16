@@ -1,13 +1,18 @@
 {
   "name": "h2e-crm-whatsapp-web-bridge",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "Serviço Node.js multi-conta para pareamento QR do H2E CRM WhatsApp Web (integração não oficial)",
+  "type": "module",
+  "description": "Serviço Node.js multi-conta para pareamento do H2E CRM WhatsApp Web, com correção comunitária para companion_reg_refresh",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.18",
+    "@whiskeysockets/baileys": "github:doryani-ai/Baileys#fix/companion-reg-refresh",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "pino": "^9.6.0",

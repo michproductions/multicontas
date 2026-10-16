@@ -1,13 +1,13 @@
-require('dotenv').config();
-const express = require('express');
-const pino = require('pino');
-const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { SocksProxyAgent } = require('socks-proxy-agent');
+import 'dotenv/config';
+import express from 'express';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -113,8 +113,21 @@ async function startAccount(id) {
       const authDir = accountAuthDir(id);
       fs.mkdirSync(authDir, { recursive: true });
       const { state, saveCreds } = await useMultiFileAuthState(authDir);
-      let version;
-      try { ({ version } = await fetchLatestBaileysVersion()); } catch (_) { version = undefined; }
+      // Query WhatsApp Web itself for its current protocol version. The older
+      // fetchLatestBaileysVersion() helper can return a stale version and produce
+      // a QR that scans but cannot finish linking.
+      let versionInfo;
+      try {
+        versionInfo = await fetchLatestWaWebVersion();
+      } catch (versionError) {
+        throw new Error('Não foi possível consultar a versão atual do WhatsApp Web: ' + (versionError?.message || 'falha de rede'));
+      }
+      if (!versionInfo?.version || versionInfo.isLatest === false) {
+        const detail = versionInfo?.error?.message ? ': ' + versionInfo.error.message : '';
+        throw new Error('A versão atual do WhatsApp Web não pôde ser validada. Verifique a saída HTTPS da Hostinger para web.whatsapp.com' + detail);
+      }
+      const version = versionInfo.version;
+      logger.info({ accountId: id, waWebVersion: version.join('.') }, 'Using live WhatsApp Web version');
       const agent = proxyAgent(meta.proxyUrl);
       const sock = makeWASocket({
         auth: state, version, logger, printQRInTerminal: false,
@@ -139,8 +152,10 @@ async function startAccount(id) {
         }
         if (connection === 'close') {
           run.connected = false; run.connecting = false;
-          if (run.intentionalClose) { run.intentionalClose = false; run.startPromise = null; return; }
           const code = lastDisconnect?.error?.output?.statusCode;
+          const closeMessage = lastDisconnect?.error?.message || 'Motivo não informado';
+          logger.warn({ accountId: id, code: code ?? null, error: closeMessage }, 'WhatsApp connection closed');
+          if (run.intentionalClose) { run.intentionalClose = false; run.startPromise = null; return; }
           if (code === DisconnectReason.loggedOut) {
             run.lastError = 'Esta sessão foi desconectada pelo WhatsApp. Gere um novo QR Code.';
             run.qr = ''; run.startPromise = null;

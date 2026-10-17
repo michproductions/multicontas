@@ -16,7 +16,7 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.1';
+const SERVICE_VERSION = '2.4.2';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
 const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');

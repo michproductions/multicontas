@@ -1,13 +1,13 @@
 {
   "name": "h2e-crm-whatsapp-web-bridge",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "private": true,
   "type": "module",
-  "description": "Serviço Node.js multi-conta para H2E CRM WhatsApp Web com correções de pareamento pré-login e QR refresh",
+  "description": "Serviço Node.js multi-conta para H2E CRM WhatsApp Web com correções de pareamento e QR refresh",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "postinstall": "node scripts/patch-baileys-prelogin.js"
+    "postinstall": "node patch-baileys-prelogin.js"
   },
   "engines": {
     "node": ">=20"

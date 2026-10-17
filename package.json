@@ -1,9 +1,9 @@
 {
   "name": "h2e-crm-whatsapp-web-bridge",
-  "version": "2.4.5",
+  "version": "2.4.6",
   "private": true,
   "type": "module",
-  "description": "Serviço Node.js multi-conta H2E CRM com correção de compatibilidade de ID principal, diagnóstico de pareamento e correções Baileys",
+  "description": "Serviço Node.js multi-conta H2E CRM com armazenamento persistente estável e reconciliação de accounts.json",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

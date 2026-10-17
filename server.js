@@ -16,10 +16,40 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.5';
-const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
-const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
-const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');
+const SERVICE_VERSION = '2.4.6';
+
+// Hostinger swaps hbuilds/current to a new version on every deployment. Any
+// relative storage path under the app working directory therefore risks pointing
+// at a fresh, empty folder after redeploy. Anchor relative persistent paths to the
+// stable domain root, outside hbuilds/versions and public_html.
+function detectStableAppRoot() {
+  const cwd = path.resolve(process.cwd());
+  const hbuildsMarker = `${path.sep}hbuilds${path.sep}`;
+  const hbuildsAt = cwd.indexOf(hbuildsMarker);
+  if (hbuildsAt >= 0) return cwd.slice(0, hbuildsAt);
+  const domainsMarker = `${path.sep}domains${path.sep}`;
+  const domainsAt = cwd.lastIndexOf(domainsMarker);
+  if (domainsAt >= 0) {
+    const domainStart = domainsAt + domainsMarker.length;
+    const domainEnd = cwd.indexOf(path.sep, domainStart);
+    if (domainEnd > domainStart) return cwd.slice(0, domainEnd);
+  }
+  return path.resolve(process.env.HOME || cwd);
+}
+const APP_ROOT = detectStableAppRoot();
+function stablePath(input, fallback) {
+  const value = String(input || fallback);
+  return path.isAbsolute(value) ? path.resolve(value) : path.resolve(APP_ROOT, value);
+}
+const RAW_DATA_DIR = String(process.env.DATA_DIR || './h2e-whatsapp-data');
+const LEGACY_RELATIVE_DATA_DIR = path.isAbsolute(RAW_DATA_DIR) ? null : path.resolve(process.cwd(), RAW_DATA_DIR);
+const DATA_DIR = stablePath(RAW_DATA_DIR, './h2e-whatsapp-data');
+const SESSIONS_ROOT = stablePath(process.env.SESSIONS_DIR, path.join(DATA_DIR, 'sessions'));
+// AUTH_DIR is only used to migrate an older single-account auth folder. Preserve
+// its old working-directory meaning so the migration can still find that folder.
+const LEGACY_AUTH_DIR = path.isAbsolute(String(process.env.AUTH_DIR || ''))
+  ? path.resolve(String(process.env.AUTH_DIR))
+  : path.resolve(process.cwd(), process.env.AUTH_DIR || './auth_info');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
 const CHAT_STORE_DIR = path.join(DATA_DIR, 'chat-store');
 const MEDIA_DIR = path.join(DATA_DIR, 'media');
@@ -401,18 +431,81 @@ function getAccount(id) {
   }
   return runtime;
 }
+
+function refreshRegistryFromDisk({ startNewConnections = false, reason = 'request' } = {}) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')); }
+  catch (error) {
+    logger.warn({ reason, code: error?.code || null, error: error?.message || String(error), accountsFile: ACCOUNTS_FILE }, 'Could not refresh account registry from disk');
+    return false;
+  }
+  if (!Array.isArray(parsed)) {
+    logger.error({ reason, accountsFile: ACCOUNTS_FILE }, 'Persistent account registry is not an array');
+    return false;
+  }
+  const next = parsed.map(normalizeMeta);
+  const currentJson = JSON.stringify(registry.map(normalizeMeta));
+  const nextJson = JSON.stringify(next);
+  if (currentJson === nextJson) return false;
+  const previousIds = new Set(registry.map(account => account.id));
+  registry = next;
+  for (const meta of registry) getAccount(meta.id);
+  for (const oldId of previousIds) {
+    if (registry.some(account => account.id === oldId)) continue;
+    const staleRun = sessions.get(oldId);
+    if (staleRun?.sock) {
+      staleRun.intentionalClose = true;
+      try { staleRun.sock.end(new Error('Conta removida do registro persistente.')); } catch (_) {}
+    }
+    sessions.delete(oldId);
+  }
+  logger.warn({ reason, memoryAccountCount: registry.length, accountIds: registry.map(a => a.id), accountsFile: ACCOUNTS_FILE }, 'Account registry refreshed from persistent storage');
+  if (startNewConnections) {
+    for (const meta of registry) {
+      const existed = previousIds.has(meta.id);
+      const run = getAccount(meta.id);
+      if (!existed && !run.connected && !run.connecting && !run.qr && !run.startPromise) {
+        startAccount(meta.id).catch(error => logger.warn({ accountId: meta.id, error: error?.message || String(error) }, 'Could not start account loaded from persistent registry'));
+      }
+    }
+  }
+  return true;
+}
+
 function accountAuthDir(id) {
   return path.join(SESSIONS_ROOT, id);
 }
 function directoryHasFiles(dir) {
   try { return fs.readdirSync(dir).length > 0; } catch (_) { return false; }
 }
+function listLegacyAuthCandidates() {
+  const candidates = new Set([LEGACY_AUTH_DIR]);
+  if (path.isAbsolute(String(process.env.AUTH_DIR || ''))) return [...candidates];
+  const relative = path.relative(APP_ROOT, LEGACY_AUTH_DIR).split(path.sep);
+  let tail = null;
+  if (relative[0] === 'hbuilds' && relative[1] === 'current') tail = relative.slice(2).join(path.sep);
+  else if (relative[0] === 'hbuilds' && relative[1] === 'versions' && relative.length >= 4) tail = relative.slice(3).join(path.sep);
+  if (tail) {
+    const versionsRoot = path.join(APP_ROOT, 'hbuilds', 'versions');
+    try {
+      for (const entry of fs.readdirSync(versionsRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) candidates.add(path.join(versionsRoot, entry.name, tail));
+      }
+    } catch (_) {}
+  }
+  return [...candidates].filter(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isDirectory())
+    .sort((a, b) => {
+      try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch (_) { return 0; }
+    });
+}
 function migrateLegacySession() {
   if (!registry.some(a => a.id === 'principal')) return;
   const target = accountAuthDir('principal');
-  if (directoryHasFiles(target) || !directoryHasFiles(LEGACY_AUTH_DIR)) return;
-  try { fs.mkdirSync(target, { recursive: true }); fs.cpSync(LEGACY_AUTH_DIR, target, { recursive: true }); logger.info('Legacy WhatsApp session copied into the multi-account session directory.'); }
-  catch (e) { logger.warn({ err: e.message }, 'Could not migrate legacy session directory'); }
+  if (directoryHasFiles(target)) return;
+  const source = listLegacyAuthCandidates().find(directoryHasFiles);
+  if (!source) return;
+  try { fs.mkdirSync(target, { recursive: true }); fs.cpSync(source, target, { recursive: true, force: false, errorOnExist: false }); logger.info({ source, target }, 'Legacy WhatsApp session copied into the multi-account session directory.'); }
+  catch (e) { logger.warn({ source, target, err: e.message }, 'Could not migrate legacy session directory'); }
 }
 function publicAccount(meta) {
   const run = getAccount(meta.id);
@@ -583,6 +676,7 @@ async function startAccount(id) {
   try { return await run.startPromise; } finally { if (!run.connected) run.startPromise = null; }
 }
 async function createAccount(name) {
+  refreshRegistryFromDisk({ reason: 'create-account' });
   const safeName = String(name || '').trim().slice(0, 80);
   if (!safeName) throw new Error('Informe um nome para a conta.');
   if (registry.some(a => a.name.toLowerCase() === safeName.toLowerCase())) {
@@ -598,6 +692,7 @@ async function createAccount(name) {
   return publicAccount(meta);
 }
 async function removeAccount(id) {
+  refreshRegistryFromDisk({ reason: `remove-account:${id}` });
   const meta = findMeta(id);
   if (!meta) throw new Error('Conta não encontrada.');
   const run = getAccount(id);
@@ -702,38 +797,43 @@ function asyncRoute(fn) { return (req, res) => Promise.resolve(fn(req, res)).cat
 // ID is missing locally; then resolve the alias only if there is one unambiguous
 // account. Never guess between multiple accounts or overwrite a real ID.
 function refreshRegistryForRequestedId(requestedId) {
-  if (registry.some(account => account.id === requestedId)) return;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-    if (!Array.isArray(parsed)) return;
-    const diskRegistry = parsed.map(normalizeMeta);
-    const diskHasRequestedId = diskRegistry.some(account => account.id === requestedId);
-    if (diskHasRequestedId || registry.length === 0) {
-      registry = diskRegistry;
-      for (const meta of registry) getAccount(meta.id);
-      logger.warn({ requestedAccountId: requestedId, memoryAccountCount: registry.length }, 'Account registry refreshed from persistent storage');
-    }
-  } catch (error) {
-    logger.warn({ requestedAccountId: requestedId, code: error?.code || null, error: error?.message || String(error) }, 'Could not refresh account registry from persistent storage');
+  refreshRegistryFromDisk({ reason: `account-route:${requestedId}` });
+  if (registry.some(account => account.id === requestedId)) return requestedId;
+  const hasRealPrincipal = registry.some(account => account.id === 'principal');
+  if (requestedId === 'principal' && !hasRealPrincipal && registry.length === 1) {
+    const canonicalId = registry[0].id;
+    logger.warn({ requestedAccountId: 'principal', resolvedAccountId: canonicalId, accountName: registry[0].name }, 'Legacy principal account alias resolved to the only registered account');
+    return canonicalId;
   }
+  return requestedId;
 }
+
+app.use('/api', (_req, res, next) => {
+  // Account lists and statuses must never be served from a browser/proxy cache.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  next();
+});
 app.use((req, _res, next) => {
   const match = req.url.match(/^\/api\/accounts\/([^/?]+)/);
   if (!match) return next();
   let requestedId = '';
   try { requestedId = decodeURIComponent(match[1]); } catch (_) { return next(); }
-  refreshRegistryForRequestedId(requestedId);
-  const hasRealPrincipal = registry.some(account => account.id === 'principal');
-  if (requestedId === 'principal' && !hasRealPrincipal && registry.length === 1) {
-    const canonicalId = registry[0].id;
-    req.url = req.url.replace(/^\/api\/accounts\/[^/?]+/, `/api/accounts/${encodeURIComponent(canonicalId)}`);
-    logger.warn({ requestedAccountId: 'principal', resolvedAccountId: canonicalId, accountName: registry[0].name }, 'Legacy principal account alias resolved to the only registered account');
-  }
+  const resolvedId = refreshRegistryForRequestedId(requestedId);
+  if (resolvedId !== requestedId) req.url = req.url.replace(/^\/api\/accounts\/[^/?]+/, `/api/accounts/${encodeURIComponent(resolvedId)}`);
   next();
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', serviceVersion: SERVICE_VERSION, accounts: registry.length }));
-app.get('/api/accounts', authorized, (_req, res) => res.json({ accounts: registry.map(publicAccount) }));
+app.get('/health', (_req, res) => {
+  refreshRegistryFromDisk({ reason: 'health' });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', serviceVersion: SERVICE_VERSION, accounts: registry.length });
+});
+app.get('/api/accounts', authorized, (_req, res) => {
+  refreshRegistryFromDisk({ startNewConnections: true, reason: 'list-accounts' });
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.json({ accounts: registry.map(publicAccount) });
+});
 app.get('/api/diagnostics', authorized, (_req, res) => {
   function findBaileysCompanionRefreshHandler(dir) {
     try {
@@ -772,6 +872,12 @@ app.get('/api/diagnostics', authorized, (_req, res) => {
   res.json({
     ok: dataWritable.ok && sessionsWritable.ok && chatStoreWritable.ok && storageConsistent,
     serviceVersion: SERVICE_VERSION,
+    processId: process.pid,
+    workingDirectory: process.cwd(),
+    stableAppRoot: APP_ROOT,
+    dataDirectory: DATA_DIR,
+    sessionsDirectory: SESSIONS_ROOT,
+    accountsFilePath: ACCOUNTS_FILE,
     baileysCompanionRefreshHandlerFound,
     nodeMajor: Number(process.versions.node.split('.')[0]),
     memoryAccountCount: registry.length,
@@ -880,6 +986,7 @@ app.post('/api/accounts/:id/connect', authorized, asyncRoute(async (req, res) =>
   await startAccount(req.params.id); res.json(publicAccount(findMeta(req.params.id)));
 }));
 app.post('/api/accounts/:id/settings', authorized, asyncRoute(async (req, res) => {
+  refreshRegistryFromDisk({ reason: `settings-account:${req.params.id}` });
   const meta = findMeta(req.params.id); if (!meta) return res.status(404).json({ error: 'Conta não encontrada' });
   const min = Number(req.body?.delayMin ?? meta.delayMin ?? 5);
   const max = Number(req.body?.delayMax ?? meta.delayMax ?? 30);
@@ -903,7 +1010,56 @@ app.post('/api/send', authorized, asyncRoute(async (req, res) => {
   const result = await sendMessage(selected, req.body?.phone, req.body?.message); res.json(result);
 }));
 
+function listLegacyDataCandidates() {
+  const candidates = new Set();
+  if (LEGACY_RELATIVE_DATA_DIR && LEGACY_RELATIVE_DATA_DIR !== DATA_DIR) candidates.add(LEGACY_RELATIVE_DATA_DIR);
+  // Hostinger keeps successful versions under hbuilds/versions. If the previous
+  // version wrote relative data there, look for the newest existing data folder.
+  if (LEGACY_RELATIVE_DATA_DIR) {
+    const relative = path.relative(APP_ROOT, LEGACY_RELATIVE_DATA_DIR).split(path.sep);
+    let tail = null;
+    if (relative[0] === 'hbuilds' && relative[1] === 'current') tail = relative.slice(2).join(path.sep);
+    else if (relative[0] === 'hbuilds' && relative[1] === 'versions' && relative.length >= 4) tail = relative.slice(3).join(path.sep);
+    if (tail) {
+      const versionsRoot = path.join(APP_ROOT, 'hbuilds', 'versions');
+      try {
+        for (const entry of fs.readdirSync(versionsRoot, { withFileTypes: true })) {
+          if (entry.isDirectory()) candidates.add(path.join(versionsRoot, entry.name, tail));
+        }
+      } catch (_) {}
+    }
+  }
+  return [...candidates].filter(candidate => path.resolve(candidate) !== path.resolve(DATA_DIR) && fs.existsSync(candidate) && fs.statSync(candidate).isDirectory());
+}
+function migrateLegacyDataDirectory() {
+  try {
+    if (fs.existsSync(ACCOUNTS_FILE)) return;
+    const candidates = listLegacyDataCandidates().filter(candidate => {
+      try { return fs.readdirSync(candidate).length > 0; } catch (_) { return false; }
+    });
+    candidates.sort((a, b) => {
+      const getScore = dir => {
+        try {
+          const accountFile = path.join(dir, 'accounts.json');
+          if (fs.existsSync(accountFile)) return fs.statSync(accountFile).mtimeMs + 1e12;
+          return fs.statSync(dir).mtimeMs;
+        } catch (_) { return 0; }
+      };
+      return getScore(b) - getScore(a);
+    });
+    if (!candidates.length) return;
+    const source = candidates[0];
+    fs.mkdirSync(path.dirname(DATA_DIR), { recursive: true });
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.cpSync(source, DATA_DIR, { recursive: true, force: false, errorOnExist: false });
+    logger.warn({ source, target: DATA_DIR }, 'Migrated legacy version-local data to stable Hostinger storage');
+  } catch (error) {
+    logger.error({ code: error.code || null, error: error.message }, 'Could not migrate legacy data directory');
+  }
+}
+
 async function boot() {
+  migrateLegacyDataDirectory();
   fs.mkdirSync(DATA_DIR, { recursive: true }); fs.mkdirSync(SESSIONS_ROOT, { recursive: true }); fs.mkdirSync(CHAT_STORE_DIR, { recursive: true }); fs.mkdirSync(MEDIA_DIR, { recursive: true });
   const accountStoreExisted = fs.existsSync(ACCOUNTS_FILE);
   try { const read = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')); if (Array.isArray(read)) registry = read.map(normalizeMeta); }
@@ -917,6 +1073,6 @@ async function boot() {
     getAccount(meta.id);
     startAccount(meta.id).catch(err => logger.warn({ accountId:meta.id, err:err.message }, 'Initial account start failed'));
   }
-  app.listen(PORT, HOST, () => logger.info({ serviceVersion: SERVICE_VERSION, nodeVersion: process.versions.node, accountCount: registry.length }, `H2E multi-account bridge listening on ${HOST}:${PORT}`));
+  app.listen(PORT, HOST, () => logger.info({ serviceVersion: SERVICE_VERSION, nodeVersion: process.versions.node, accountCount: registry.length, dataDirectory: DATA_DIR, accountsFile: ACCOUNTS_FILE, workingDirectory: process.cwd() }, `H2E multi-account bridge listening on ${HOST}:${PORT}`));
 }
 boot().catch(err => { logger.error({ err:err.message }, 'Bridge startup failed'); process.exit(1); });

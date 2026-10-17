@@ -1,0 +1,23 @@
+{
+  "name": "h2e-crm-whatsapp-web-bridge",
+  "version": "2.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Serviço Node.js multi-conta para pareamento do H2E CRM WhatsApp Web, com correção comunitária para companion_reg_refresh",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "github:doryani-ai/Baileys#fix/companion-reg-refresh",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "https-proxy-agent": "^7.0.6",
+    "socks-proxy-agent": "^8.0.5"
+  }
+}

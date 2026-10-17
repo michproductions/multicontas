@@ -1,9 +1,9 @@
 {
   "name": "h2e-crm-whatsapp-web-bridge",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
-  "description": "Serviço Node.js multi-conta para pareamento do H2E CRM WhatsApp Web, com correção comunitária para companion_reg_refresh",
+  "description": "Serviço Node.js multi-conta para H2E CRM WhatsApp Web, cache de conversas, contatos, histórico e envio pela caixa de entrada",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

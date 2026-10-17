@@ -14,11 +14,12 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.2.0';
+const SERVICE_VERSION = '2.3.0';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
 const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
+const CHAT_STORE_DIR = path.join(DATA_DIR, 'chat-store');
 const WP_INBOUND = process.env.WORDPRESS_INBOUND_URL || '';
 const logger = pino({ level: process.env.LOG_LEVEL || 'warn' });
 const sessions = new Map();
@@ -28,9 +29,222 @@ function authorized(req, res, next) {
   if (!SECRET || req.get('x-h2e-secret') !== SECRET) return res.status(401).json({ error: 'Não autorizado' });
   next();
 }
+function unwrapMessage(message) {
+  let value = message || {};
+  for (let i = 0; i < 5; i++) {
+    const next = value.ephemeralMessage?.message || value.viewOnceMessage?.message || value.viewOnceMessageV2?.message || value.viewOnceMessageV2Extension?.message || value.documentWithCaptionMessage?.message || value.editedMessage?.message;
+    if (!next) break;
+    value = next;
+  }
+  return value;
+}
+function messageType(m) {
+  const msg = unwrapMessage(m?.message);
+  const types = {
+    conversation: 'text', extendedTextMessage: 'text', imageMessage: 'image', videoMessage: 'video',
+    audioMessage: 'audio', documentMessage: 'document', stickerMessage: 'sticker', locationMessage: 'location',
+    liveLocationMessage: 'location', contactMessage: 'contact', contactsArrayMessage: 'contacts',
+    buttonsResponseMessage: 'text', listResponseMessage: 'text', templateButtonReplyMessage: 'text',
+    reactionMessage: 'reaction', pollCreationMessage: 'poll', pollUpdateMessage: 'poll'
+  };
+  for (const key of Object.keys(msg)) if (types[key]) return types[key];
+  return 'unknown';
+}
 function textFromMessage(m) {
-  const msg = m.message || {};
-  return msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || msg.documentMessage?.caption || msg.buttonsResponseMessage?.selectedDisplayText || msg.listResponseMessage?.title || '';
+  const msg = unwrapMessage(m?.message);
+  const body = msg.conversation || msg.extendedTextMessage?.text || msg.imageMessage?.caption || msg.videoMessage?.caption || msg.documentMessage?.caption || msg.buttonsResponseMessage?.selectedDisplayText || msg.listResponseMessage?.title || msg.templateButtonReplyMessage?.selectedDisplayText || msg.contactMessage?.displayName || msg.contactsArrayMessage?.displayName || msg.locationMessage?.name || msg.locationMessage?.address || msg.pollCreationMessage?.name || msg.pollCreationMessageV3?.name;
+  if (body) return String(body);
+  const placeholders = { image: '[Imagem]', video: '[Vídeo]', audio: '[Áudio]', document: '[Documento]', sticker: '[Figurinha]', location: '[Localização]', contact: '[Contato]', contacts: '[Contatos]', reaction: '[Reação]', poll: '[Enquete]' };
+  return placeholders[messageType(m)] || '';
+}
+function toSeconds(value) {
+  if (value && typeof value === 'object') {
+    if (typeof value.toNumber === 'function') value = value.toNumber();
+    else if (value.low !== undefined) value = value.low;
+  }
+  if (value === undefined || value === null || value === '') return 0;
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+}
+function jidPhone(jid, alt = '') {
+  const candidates = [alt, jid].filter(Boolean).map(v => String(v));
+  for (const candidate of candidates) {
+    if (!candidate.endsWith('@s.whatsapp.net') && !/^\+?\d{7,20}$/.test(candidate.split('@')[0].split(':')[0])) continue;
+    const digits = candidate.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (digits.length >= 7 && digits.length <= 20) return digits;
+  }
+  return '';
+}
+function ignoredJid(jid) {
+  const v = String(jid || '');
+  return !v || v === 'status@broadcast' || v.endsWith('@broadcast') || v.endsWith('@newsletter');
+}
+function chatStatePath(id) { return path.join(CHAT_STORE_DIR, `${id}.json`); }
+function loadChatState(id) {
+  try {
+    const data = JSON.parse(fs.readFileSync(chatStatePath(id), 'utf8'));
+    return { chats: Array.isArray(data.chats) ? data.chats : [], contacts: Array.isArray(data.contacts) ? data.contacts : [] };
+  } catch (_) { return { chats: [], contacts: [] }; }
+}
+function persistChatState(id) {
+  const run = sessions.get(id);
+  if (!run) return;
+  try {
+    fs.mkdirSync(CHAT_STORE_DIR, { recursive: true });
+    const chats = [...run.chats.values()].sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0)).slice(0, 1500).map(chat => ({
+      jid: chat.jid, phone: chat.phone || '', name: chat.name || '', isGroup: !!chat.isGroup,
+      isBusiness: !!chat.isBusiness, savedInWhatsApp: !!chat.savedInWhatsApp,
+      unreadCount: Number(chat.unreadCount || 0), archived: !!chat.archived,
+      lastMessage: chat.lastMessage || '', lastTimestamp: Number(chat.lastTimestamp || 0), lastFromMe: !!chat.lastFromMe,
+      messages: (Array.isArray(chat.messages) ? chat.messages : []).slice(-150)
+    }));
+    const contacts = [...run.contacts.values()].slice(0, 3000).map(c => ({
+      id: c.id, name: c.name || '', notify: c.notify || '', verifiedName: c.verifiedName || '',
+      businessName: c.businessName || '', isBusiness: !!c.isBusiness, savedInWhatsApp: !!c.savedInWhatsApp,
+      phone: c.phone || ''
+    }));
+    const target = chatStatePath(id), tmp = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ schemaVersion: 1, updatedAt: new Date().toISOString(), chats, contacts }), { mode: 0o600 });
+    fs.renameSync(tmp, target);
+  } catch (e) { logger.warn({ accountId: id, code: e.code || null, error: e.message }, 'Could not persist WhatsApp chats cache'); }
+}
+function chatNameCandidate(...values) {
+  for (const v of values) {
+    const x = String(v || '').trim();
+    if (x && !/^\+?[\d\s().-]+$/.test(x)) return x.slice(0, 190);
+  }
+  return '';
+}
+function ensureChat(run, jid) {
+  let chat = run.chats.get(jid);
+  if (!chat) {
+    const contact = run.contacts.get(jid) || {};
+    chat = {
+      jid, phone: contact.phone || jidPhone(jid), name: chatNameCandidate(contact.verifiedName, contact.name, contact.notify),
+      isGroup: jid.endsWith('@g.us'), isBusiness: !!contact.isBusiness || !!contact.verifiedName,
+      savedInWhatsApp: !!contact.savedInWhatsApp, unreadCount: 0, archived: false,
+      lastMessage: '', lastTimestamp: 0, lastFromMe: false, messages: []
+    };
+    run.chats.set(jid, chat);
+  }
+  const contact = run.contacts.get(jid);
+  if (contact) {
+    chat.phone = contact.phone || chat.phone || jidPhone(jid);
+    chat.name = chatNameCandidate(contact.verifiedName, contact.name, contact.notify, chat.name) || chat.name;
+    chat.savedInWhatsApp = !!contact.savedInWhatsApp;
+    chat.isBusiness = !!chat.isBusiness || !!contact.isBusiness || !!contact.verifiedName;
+  }
+  chat.isGroup = !!chat.isGroup || jid.endsWith('@g.us');
+  return chat;
+}
+function cacheContact(accountId, input, persist = true) {
+  const run = getAccount(accountId);
+  const id = String(input?.id || input?.jid || '').trim();
+  if (ignoredJid(id)) return;
+  const previous = run.contacts.get(id) || {};
+  const name = chatNameCandidate(input.name, input.notify, input.verifiedName, previous.name);
+  const contact = {
+    id,
+    name: name || '',
+    notify: chatNameCandidate(input.notify, previous.notify) || '',
+    verifiedName: chatNameCandidate(input.verifiedName, previous.verifiedName) || '',
+    businessName: chatNameCandidate(input.businessName, previous.businessName) || '',
+    isBusiness: !!input.isBusiness || !!input.verifiedName || !!previous.isBusiness,
+    savedInWhatsApp: !!(input.name || input.notify || input.verifiedName || previous.savedInWhatsApp),
+    phone: jidPhone(id, input.phoneNumber || input.phone || previous.phone)
+  };
+  run.contacts.set(id, contact);
+  const chat = ensureChat(run, id);
+  if (contact.name) chat.name = contact.name;
+  chat.phone = contact.phone || chat.phone;
+  chat.savedInWhatsApp = contact.savedInWhatsApp;
+  chat.isBusiness = chat.isBusiness || contact.isBusiness;
+  if (persist) persistChatState(accountId);
+}
+function cacheChatMeta(accountId, item, persist = true) {
+  const jid = String(item?.id || item?.jid || '').trim();
+  if (ignoredJid(jid)) return;
+  const run = getAccount(accountId);
+  const chat = ensureChat(run, jid);
+  const candidate = chatNameCandidate(item.name, item.subject, item.displayName);
+  if (candidate) chat.name = candidate;
+  chat.phone = jidPhone(jid, item.phone || item.phoneNumber || item.idAlt) || chat.phone || '';
+  chat.isGroup = jid.endsWith('@g.us') || !!item.isGroup || chat.isGroup;
+  chat.isBusiness = !!item.isBusiness || !!item.verifiedName || chat.isBusiness;
+  if (item.unreadCount !== undefined) chat.unreadCount = Math.max(0, Number(item.unreadCount) || 0);
+  if (item.archive !== undefined) chat.archived = !!item.archive;
+  if (item.archived !== undefined) chat.archived = !!item.archived;
+  const ts = toSeconds(item.conversationTimestamp || item.lastTimestamp || item.timestamp || 0);
+  if (ts > 0 && ts > Number(chat.lastTimestamp || 0)) chat.lastTimestamp = ts;
+  if (persist) persistChatState(accountId);
+}
+function cacheMessage(accountId, message, options = {}) {
+  const key = message?.key || {};
+  const jid = String(key.remoteJid || key.remoteJidAlt || message?.jid || '').trim();
+  if (ignoredJid(jid)) return null;
+  const run = getAccount(accountId);
+  const chat = ensureChat(run, jid);
+  const type = messageType(message);
+  const text = textFromMessage(message) || (type !== 'unknown' ? `[${type}]` : '');
+  const timestamp = toSeconds(message.messageTimestamp || message.timestamp || message.messageStubParameters?.[0]) || Math.floor(Date.now() / 1000);
+  const id = String(key.id || message.id || `${jid}:${timestamp}:${key.fromMe ? 'out' : 'in'}`);
+  const fromMe = !!key.fromMe;
+  const msgKey = { remoteJid: key.remoteJid || jid, id, fromMe, ...(key.participant ? { participant: key.participant } : {}) };
+  const saved = {
+    id, jid, fromMe, text, type, timestamp,
+    status: fromMe ? 'sent' : 'received',
+    ...(key.participant ? { participant: key.participant } : {}), key: msgKey
+  };
+  const index = chat.messages.findIndex(m => String(m.id) === id);
+  if (index >= 0) chat.messages[index] = { ...chat.messages[index], ...saved };
+  else chat.messages.push(saved);
+  chat.messages.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+  if (chat.messages.length > 150) chat.messages = chat.messages.slice(-150);
+  const candidate = chatNameCandidate(message.pushName, message.notifyName);
+  if (candidate && (!chat.name || chat.name === chat.phone || /^\d+$/.test(chat.name))) chat.name = candidate;
+  chat.phone = jidPhone(jid, key.remoteJidAlt) || chat.phone || '';
+  if (timestamp >= Number(chat.lastTimestamp || 0)) {
+    chat.lastMessage = text;
+    chat.lastTimestamp = timestamp;
+    chat.lastFromMe = fromMe;
+  }
+  chat.isGroup = chat.isGroup || jid.endsWith('@g.us');
+  if (!fromMe && options.incrementUnread) chat.unreadCount = Number(chat.unreadCount || 0) + 1;
+  if (fromMe && options.incrementUnread) chat.unreadCount = 0;
+  if (options.persist !== false) persistChatState(accountId);
+  return { chat, message: saved };
+}
+function publicChat(chat) {
+  return {
+    jid: chat.jid, phone: chat.phone || jidPhone(chat.jid), name: chat.name || chat.phone || chat.jid,
+    isGroup: !!chat.isGroup, isBusiness: !!chat.isBusiness, savedInWhatsApp: !!chat.savedInWhatsApp,
+    unreadCount: Number(chat.unreadCount || 0), archived: !!chat.archived,
+    lastMessage: chat.lastMessage || '', lastTimestamp: Number(chat.lastTimestamp || 0), lastFromMe: !!chat.lastFromMe,
+    messageCount: Array.isArray(chat.messages) ? chat.messages.length : 0
+  };
+}
+function listChats(accountId) {
+  const run = getAccount(accountId);
+  // Include address-book contacts even if they have not started a conversation yet.
+  for (const contact of run.contacts.values()) ensureChat(run, contact.id);
+  return [...run.chats.values()].filter(c => !ignoredJid(c.jid)).map(publicChat)
+    .sort((a, b) => (b.lastTimestamp || 0) - (a.lastTimestamp || 0) || String(a.name).localeCompare(String(b.name)));
+}
+function getChatMessages(accountId, jid) {
+  const run = getAccount(accountId);
+  let chat = run.chats.get(jid);
+  // Let a saved CRM contact start a new WhatsApp conversation even before it
+  // appears in the WhatsApp address-book/history cache.
+  if (!chat && /^\d{7,20}@s\.whatsapp\.net$/.test(String(jid || ''))) {
+    chat = ensureChat(run, jid);
+    persistChatState(accountId);
+  }
+  if (!chat) return { chat: null, messages: [] };
+  return { chat: publicChat(chat), messages: (chat.messages || []).map(m => ({
+    id: m.id, jid: m.jid, fromMe: !!m.fromMe, text: m.text || '', type: m.type || 'text',
+    timestamp: Number(m.timestamp || 0), status: m.status || '', participant: m.participant || ''
+  })).sort((a, b) => a.timestamp - b.timestamp) };
 }
 function cleanProxy(value) {
   const proxy = String(value || '').trim();
@@ -61,7 +275,13 @@ function getAccount(id) {
   if (!meta) return null;
   let runtime = sessions.get(id);
   if (!runtime) {
-    runtime = { id, sock: null, qr: '', connected: false, connecting: false, lastError: '', phone: '', startPromise: null, intentionalClose: false };
+    const saved = loadChatState(id);
+    runtime = {
+      id, sock: null, qr: '', connected: false, connecting: false, lastError: '', phone: '',
+      startPromise: null, intentionalClose: false,
+      chats: new Map((saved.chats || []).filter(c => c && c.jid).map(c => [String(c.jid), c])),
+      contacts: new Map((saved.contacts || []).filter(c => c && c.id).map(c => [String(c.id), c]))
+    };
     sessions.set(id, runtime);
   }
   return runtime;
@@ -140,11 +360,38 @@ async function startAccount(id) {
       const sock = makeWASocket({
         auth: state, version, logger, printQRInTerminal: false,
         browser: ['H2E CRM WhatsApp', 'Chrome', '1.0.0'],
-        markOnlineOnConnect: false, syncFullHistory: false,
+        markOnlineOnConnect: false, syncFullHistory: true, shouldSyncHistoryMessage: () => true,
         ...(agent ? { agent, fetchAgent: agent } : {})
       });
       run.sock = sock;
       sock.ev.on('creds.update', saveCreds);
+      const storeContacts = (items) => { for (const c of items || []) cacheContact(id, c, false); persistChatState(id); };
+      const storeChats = (items) => { for (const c of items || []) cacheChatMeta(id, c, false); persistChatState(id); };
+      sock.ev.on('contacts.upsert', storeContacts);
+      sock.ev.on('contacts.update', storeContacts);
+      sock.ev.on('contacts.set', event => storeContacts(event?.contacts || []));
+      sock.ev.on('chats.upsert', storeChats);
+      sock.ev.on('chats.update', storeChats);
+      sock.ev.on('chats.set', event => storeChats(event?.chats || []));
+      sock.ev.on('messaging-history.set', event => {
+        try {
+          for (const c of event?.contacts || []) cacheContact(id, c, false);
+          for (const c of event?.chats || []) cacheChatMeta(id, c, false);
+          for (const m of event?.messages || []) cacheMessage(id, m, { persist: false, incrementUnread: false });
+          persistChatState(id);
+          logger.info({ accountId: id, chats: (event?.chats || []).length, contacts: (event?.contacts || []).length, messages: (event?.messages || []).length, isLatest: !!event?.isLatest }, 'WhatsApp history synchronized');
+        } catch (e) { logger.warn({ accountId: id, error: e.message }, 'Could not process WhatsApp history'); }
+      });
+      sock.ev.on('messages.update', updates => {
+        const runState = getAccount(id);
+        for (const update of updates || []) {
+          const k = update?.key || {}; const jid = String(k.remoteJid || ''); const chat = runState.chats.get(jid);
+          if (!chat || !Array.isArray(chat.messages)) continue;
+          const message = chat.messages.find(m => m.id === k.id);
+          if (message && update.update?.status !== undefined) message.status = String(update.update.status);
+        }
+        persistChatState(id);
+      });
       sock.ev.on('connection.update', async update => {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
@@ -175,18 +422,29 @@ async function startAccount(id) {
         }
       });
       sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+        let changed = false;
         for (const m of messages || []) {
-          if (!m.message || m.key?.fromMe || m.key?.remoteJid?.endsWith('@g.us') || m.key?.remoteJid === 'status@broadcast') continue;
-          const from = (m.key.remoteJid || '').split('@')[0].split(':')[0];
-          const body = textFromMessage(m);
-          if (!from || !body) continue;
-          await notifyWordPress({
-            event: 'message', accountId: id, accountName: meta.name, from,
-            name: m.pushName || from, text: body, id: m.key.id || '',
-            timestamp: m.messageTimestamp ? Number(m.messageTimestamp) : Math.floor(Date.now()/1000), type: 'text'
-          });
+          const key = m.key || {};
+          const jid = String(key.remoteJid || key.remoteJidAlt || '');
+          if (!m.message || ignoredJid(jid)) continue;
+          const cached = cacheMessage(id, m, { persist: false, incrementUnread: type === 'notify' });
+          if (cached) changed = true;
+          // Import new direct inbound text/media messages into the CRM contact history.
+          // Group chats and LID-only identities stay in the Node inbox cache to avoid
+          // creating invalid phone records in the CRM's telephone field.
+          if (type === 'notify' && !key.fromMe && jid.endsWith('@s.whatsapp.net')) {
+            const from = jidPhone(jid, key.remoteJidAlt);
+            const body = textFromMessage(m);
+            if (from && body) {
+              await notifyWordPress({
+                event: 'message', accountId: id, accountName: meta.name, from,
+                name: m.pushName || from, text: body, id: key.id || '',
+                timestamp: toSeconds(m.messageTimestamp), type: messageType(m)
+              });
+            }
+          }
         }
+        if (changed) persistChatState(id);
       });
       return true;
     } catch (e) {
@@ -220,19 +478,47 @@ async function removeAccount(id) {
   registry = registry.filter(a => a.id !== id); persistRegistry(); sessions.delete(id);
   try { fs.rmSync(accountAuthDir(id), { recursive: true, force: true }); } catch (_) {}
 }
-async function sendMessage(accountId, phone, message) {
+async function sendChatMessage(accountId, target, message) {
   const meta = findMeta(accountId); const run = meta ? getAccount(accountId) : null;
   if (!meta || !run?.connected || !run.sock) throw new Error('A conta selecionada não está conectada.');
-  const number = String(phone || '').replace(/\D/g, '');
+  let jid = String(target || '').trim();
+  if (/^\+?[0-9][0-9\s().-]{5,20}$/.test(jid)) jid = jid.replace(/\D/g, '') + '@s.whatsapp.net';
+  if (!/@(s\.whatsapp\.net|g\.us|lid)$/.test(jid)) throw new Error('Destino de conversa inválido. Selecione um contato, número ou grupo do WhatsApp.');
   const text = String(message || '').trim();
-  if (!number || !text) throw new Error('Telefone e mensagem são obrigatórios.');
+  if (!text) throw new Error('Digite uma mensagem antes de enviar.');
   const min = Math.max(0, Math.min(3600, Number(meta.delayMin ?? 5)));
   const max = Math.max(min, Math.min(3600, Number(meta.delayMax ?? 30)));
   const delaySeconds = min + Math.random() * (max - min);
   if (delaySeconds > 0) await new Promise(resolve => setTimeout(resolve, Math.round(delaySeconds * 1000)));
-  const jid = number + '@s.whatsapp.net';
   const sent = await run.sock.sendMessage(jid, { text });
-  return { ok: true, id: sent?.key?.id || '', accountId, delayedSeconds: Math.round(delaySeconds) };
+  const saved = cacheMessage(accountId, { key: sent?.key || { remoteJid: jid, id: crypto.randomUUID(), fromMe: true }, message: sent?.message || { conversation: text }, messageTimestamp: Math.floor(Date.now() / 1000) }, { persist: true, incrementUnread: false });
+  return { ok: true, id: sent?.key?.id || saved?.message?.id || '', accountId, jid, delayedSeconds: Math.round(delaySeconds), message: saved?.message || null, chat: saved ? publicChat(saved.chat) : null };
+}
+async function sendMessage(accountId, phone, message) {
+  const number = String(phone || '').replace(/\D/g, '');
+  if (!number) throw new Error('Informe um número de telefone com DDI e DDD.');
+  return sendChatMessage(accountId, number, message);
+}
+async function markChatRead(accountId, jid) {
+  const meta = findMeta(accountId); const run = meta ? getAccount(accountId) : null;
+  if (!meta || !run) throw new Error('Conta não encontrada.');
+  const chat = run.chats.get(String(jid || ''));
+  if (!chat) throw new Error('Conversa não encontrada no cache sincronizado.');
+  const keys = (chat.messages || []).filter(m => !m.fromMe && m.key && m.key.id).slice(-50).map(m => m.key);
+  if (run.sock?.readMessages && keys.length) {
+    try { await run.sock.readMessages(keys); } catch (e) { logger.debug({ accountId, jid, error: e.message }, 'Could not send read receipt'); }
+  }
+  chat.unreadCount = 0; persistChatState(accountId);
+  return { ok: true, jid, unreadCount: 0 };
+}
+async function archiveChat(accountId, jid, archived) {
+  const meta = findMeta(accountId); const run = meta ? getAccount(accountId) : null;
+  if (!meta || !run) throw new Error('Conta não encontrada.');
+  const chat = run.chats.get(String(jid || ''));
+  if (!chat) throw new Error('Conversa não encontrada no cache sincronizado.');
+  if (run.sock?.chatModify) await run.sock.chatModify({ archive: !!archived }, chat.jid);
+  chat.archived = !!archived; persistChatState(accountId);
+  return { ok: true, jid: chat.jid, archived: chat.archived };
 }
 function getDefaultAccount() {
   const connected = registry.find(a => getAccount(a.id).connected);
@@ -257,11 +543,12 @@ app.get('/api/diagnostics', authorized, (_req, res) => {
   catch (e) { fileError = e.code || 'READ_ERROR'; }
   const dataWritable = testWritable(DATA_DIR);
   const sessionsWritable = testWritable(SESSIONS_ROOT);
+  const chatStoreWritable = testWritable(CHAT_STORE_DIR);
   const memoryIds = registry.map(a => a.id).sort();
   const diskIds = Array.isArray(diskAccounts) ? diskAccounts.map(a => String(a.id)).sort() : [];
   const storageConsistent = Array.isArray(diskAccounts) && JSON.stringify(memoryIds) === JSON.stringify(diskIds);
   res.json({
-    ok: dataWritable.ok && sessionsWritable.ok && storageConsistent,
+    ok: dataWritable.ok && sessionsWritable.ok && chatStoreWritable.ok && storageConsistent,
     serviceVersion: SERVICE_VERSION,
     nodeMajor: Number(process.versions.node.split('.')[0]),
     memoryAccountCount: registry.length,
@@ -272,12 +559,35 @@ app.get('/api/diagnostics', authorized, (_req, res) => {
     dataDirectoryError: dataWritable.errorCode,
     sessionsDirectoryWritable: sessionsWritable.ok,
     sessionsDirectoryError: sessionsWritable.errorCode,
+    chatStoreDirectoryWritable: chatStoreWritable.ok,
+    chatStoreDirectoryError: chatStoreWritable.errorCode,
+    cachedChatCount: [...sessions.values()].reduce((sum, run) => sum + run.chats.size, 0),
+    cachedContactCount: [...sessions.values()].reduce((sum, run) => sum + run.contacts.size, 0),
     accountsFileError: fileError,
     bridgeSecretConfigured: Boolean(SECRET),
     wordpressCallbackConfigured: Boolean(WP_INBOUND)
   });
 });
 app.post('/api/accounts', authorized, asyncRoute(async (req, res) => { const account = await createAccount(req.body?.name); res.status(201).json({ account }); }));
+app.get('/api/accounts/:id/chats', authorized, (req, res) => {
+  if (!findMeta(req.params.id)) return res.status(404).json({ error: 'Conta não encontrada' });
+  const chats = listChats(req.params.id);
+  res.json({ accountId: req.params.id, chats, historySyncEnabled: true, chatCount: chats.length });
+});
+app.get('/api/accounts/:id/messages', authorized, (req, res) => {
+  if (!findMeta(req.params.id)) return res.status(404).json({ error: 'Conta não encontrada' });
+  const jid = String(req.query.jid || '');
+  if (!jid) return res.status(400).json({ error: 'Informe o parâmetro jid da conversa.' });
+  const result = getChatMessages(req.params.id, jid);
+  if (!result.chat) return res.status(404).json({ error: 'Conversa ainda não aparece no cache sincronizado. Aguarde a sincronização de chats/contatos do WhatsApp.' });
+  res.json(result);
+});
+app.post('/api/accounts/:id/messages', authorized, asyncRoute(async (req, res) => {
+  if (!findMeta(req.params.id)) return res.status(404).json({ error: 'Conta não encontrada' });
+  res.json(await sendChatMessage(req.params.id, req.body?.jid || req.body?.phone, req.body?.text || req.body?.message));
+}));
+app.post('/api/accounts/:id/chats/read', authorized, asyncRoute(async (req, res) => res.json(await markChatRead(req.params.id, req.body?.jid))));
+app.post('/api/accounts/:id/chats/archive', authorized, asyncRoute(async (req, res) => res.json(await archiveChat(req.params.id, req.body?.jid, req.body?.archived))));
 app.get('/api/accounts/:id/status', authorized, (req, res) => {
   const meta = findMeta(req.params.id); if (!meta) return res.status(404).json({ error: 'Conta não encontrada' });
   res.json(publicAccount(meta));
@@ -315,7 +625,7 @@ app.post('/api/send', authorized, asyncRoute(async (req, res) => {
 }));
 
 async function boot() {
-  fs.mkdirSync(DATA_DIR, { recursive: true }); fs.mkdirSync(SESSIONS_ROOT, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true }); fs.mkdirSync(SESSIONS_ROOT, { recursive: true }); fs.mkdirSync(CHAT_STORE_DIR, { recursive: true });
   const accountStoreExisted = fs.existsSync(ACCOUNTS_FILE);
   try { const read = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')); if (Array.isArray(read)) registry = read.map(normalizeMeta); }
   catch (_) { registry = []; }

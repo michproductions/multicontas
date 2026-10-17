@@ -12,6 +12,7 @@ const pending = [packageRoot];
 let patchedFiles = 0;
 let alreadyPatchedFiles = 0;
 let matchedOriginal = 0;
+let hasCompanionRefreshHandler = false;
 
 while (pending.length) {
   const current = pending.pop();
@@ -30,6 +31,7 @@ while (pending.length) {
 
     let source;
     try { source = fs.readFileSync(full, 'utf8'); } catch { continue; }
+    if (source.includes('companion_reg_refresh')) hasCompanionRefreshHandler = true;
     if (!source.includes('buildAckStanza')) continue;
 
     const originalPattern = /(buildAckStanza\s*\(\s*node\s*,\s*errorCode\s*,\s*authState\.creds\.me)\.id(\s*\))/g;
@@ -50,4 +52,9 @@ if (patchedFiles === 0 && alreadyPatchedFiles === 0) {
   console.error('[H2E] Não encontrei a chamada esperada de buildAckStanza em Baileys. A instalação foi interrompida para não publicar sem a correção pré-login. Verifique a versão da dependência.');
   process.exit(1);
 }
+if (!hasCompanionRefreshHandler) {
+  console.error('[H2E] ERRO: a dependência Baileys instalada não contém o handler companion_reg_refresh. Não publique este build: confira o commit 4f263f0 da dependência.');
+  process.exit(1);
+}
+console.log('[H2E] Handler companion_reg_refresh encontrado na Baileys instalada.');
 console.log(`[H2E] Patch de pareamento pré-login concluído. Arquivos alterados: ${patchedFiles}; já corrigidos: ${alreadyPatchedFiles}; ocorrências alteradas: ${matchedOriginal}.`);

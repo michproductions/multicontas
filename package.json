@@ -1,9 +1,9 @@
 {
   "name": "h2e-crm-whatsapp-web-bridge",
-  "version": "2.4.3",
+  "version": "2.4.4",
   "private": true,
   "type": "module",
-  "description": "Serviço Node.js multi-conta H2E CRM com retry de mídias e correção de pareamento por QR Code",
+  "description": "Serviço Node.js multi-conta H2E CRM com commit Baileys fixado, verificação do handler companion_reg_refresh e diagnóstico de pareamento",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "github:doryani-ai/Baileys#fix/companion-reg-refresh",
+    "@whiskeysockets/baileys": "github:doryani-ai/Baileys#4f263f0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "pino": "^9.6.0",

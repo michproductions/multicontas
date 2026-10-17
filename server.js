@@ -16,7 +16,7 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.3';
+const SERVICE_VERSION = '2.4.4';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
 const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');
@@ -526,7 +526,18 @@ async function startAccount(id) {
           run.connected = false; run.connecting = false;
           const code = lastDisconnect?.error?.output?.statusCode;
           const closeMessage = lastDisconnect?.error?.message || 'Motivo não informado';
+          const closeStack = typeof lastDisconnect?.error?.stack === 'string'
+            ? lastDisconnect.error.stack.split('\n').slice(0, 6)
+            : [];
           logger.warn({ accountId: id, code: code ?? null, error: closeMessage }, 'WhatsApp connection closed');
+          // Keep pairing diagnostics in one explicit line; some host dashboards hide Pino context fields.
+          console.warn('[H2E-PAIRING-DIAG] ' + JSON.stringify({
+            serviceVersion: SERVICE_VERSION,
+            accountId: id,
+            code: code ?? null,
+            error: closeMessage,
+            stack: closeStack
+          }));
           if (run.intentionalClose) { run.intentionalClose = false; run.startPromise = null; return; }
           if (code === DisconnectReason.loggedOut) {
             run.lastError = 'Esta sessão foi desconectada pelo WhatsApp. Gere um novo QR Code.';
@@ -688,6 +699,22 @@ function asyncRoute(fn) { return (req, res) => Promise.resolve(fn(req, res)).cat
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', serviceVersion: SERVICE_VERSION, accounts: registry.length }));
 app.get('/api/accounts', authorized, (_req, res) => res.json({ accounts: registry.map(publicAccount) }));
 app.get('/api/diagnostics', authorized, (_req, res) => {
+  function findBaileysCompanionRefreshHandler(dir) {
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === 'node_modules' || entry.name === '__tests__' || entry.name === 'tests') continue;
+          if (findBaileysCompanionRefreshHandler(full)) return true;
+        } else if (entry.isFile() && /\.(js|mjs|cjs)$/.test(entry.name)) {
+          try { if (fs.readFileSync(full, 'utf8').includes('companion_reg_refresh')) return true; } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+  const baileysLib = path.join(process.cwd(), 'node_modules', '@whiskeysockets', 'baileys', 'lib');
+  const baileysCompanionRefreshHandlerFound = fs.existsSync(baileysLib) && findBaileysCompanionRefreshHandler(baileysLib);
   function testWritable(dir) {
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -709,6 +736,7 @@ app.get('/api/diagnostics', authorized, (_req, res) => {
   res.json({
     ok: dataWritable.ok && sessionsWritable.ok && chatStoreWritable.ok && storageConsistent,
     serviceVersion: SERVICE_VERSION,
+    baileysCompanionRefreshHandlerFound,
     nodeMajor: Number(process.versions.node.split('.')[0]),
     memoryAccountCount: registry.length,
     storedAccountCount: Array.isArray(diskAccounts) ? diskAccounts.length : null,

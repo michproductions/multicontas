@@ -16,7 +16,7 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.7';
+const SERVICE_VERSION = '2.4.8';
 
 // Hostinger swaps hbuilds/current to a new version on every deployment. Any
 // relative storage path under the app working directory therefore risks pointing
@@ -564,6 +564,7 @@ async function startAccount(id) {
       }
       const version = versionInfo.version;
       logger.info({ accountId: id, waWebVersion: version.join('.') }, 'Using live WhatsApp Web version');
+      console.warn(`[H2E-WA-VERSION] account=${id} version=${version.join('.')} fullHistory=true`);
       const agent = proxyAgent(meta.proxyUrl);
       const sock = makeWASocket({
         auth: state, version, logger, printQRInTerminal: false,
@@ -607,6 +608,7 @@ async function startAccount(id) {
         if (qr) {
           try { run.qr = await QRCode.toDataURL(qr, { width: 280, margin: 2 }); }
           catch (err) { run.lastError = 'Não foi possível gerar QR Code: ' + err.message; }
+          console.warn(`[H2E-QR] account=${id} qrChars=${typeof qr === 'string' ? qr.length : 0} dataUrlReady=${Boolean(run.qr)}`);
           run.connected = false; run.connecting = false;
         }
         if (connection === 'open') {
@@ -622,13 +624,16 @@ async function startAccount(id) {
           const closeStack = typeof lastDisconnect?.error?.stack === 'string'
             ? lastDisconnect.error.stack.split('\n').slice(0, 6)
             : [];
-          logger.warn({ accountId: id, code: code ?? null, error: closeMessage }, 'WhatsApp connection closed');
+          // Clear expired QR data before any reconnect attempt.
+          run.qr = '';
+          logger.warn({ accountId: id, code: code ?? null, error: closeMessage, waWebVersion: version.join('.') }, 'WhatsApp connection closed');
           // Keep pairing diagnostics in one explicit line; some host dashboards hide Pino context fields.
           console.warn('[H2E-PAIRING-DIAG] ' + JSON.stringify({
             serviceVersion: SERVICE_VERSION,
             accountId: id,
             code: code ?? null,
             error: closeMessage,
+            waWebVersion: version.join('.'),
             stack: closeStack
           }));
           if (run.intentionalClose) { run.intentionalClose = false; run.startPromise = null; return; }

@@ -1,9 +1,9 @@
 {
   "name": "h2e-crm-whatsapp-web-bridge",
-  "version": "2.4.2",
+  "version": "2.4.3",
   "private": true,
   "type": "module",
-  "description": "Serviço Node.js multi-conta para H2E CRM WhatsApp Web com correções de pareamento e QR refresh",
+  "description": "Serviço Node.js multi-conta H2E CRM com retry de mídias e correção de pareamento por QR Code",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

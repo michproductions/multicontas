@@ -16,7 +16,7 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.2';
+const SERVICE_VERSION = '2.4.3';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
 const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');
@@ -28,6 +28,8 @@ const MAX_OUTBOUND_MEDIA_BYTES = 16 * 1024 * 1024;
 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'document']);
 const mediaDownloadQueue = [];
 const mediaDownloadQueued = new Set();
+// Keep recent raw Baileys media messages in memory so the inbox can retry failed media downloads.
+const rawMediaMessageCache = new Map();
 let mediaWorkerRunning = false;
 const WP_INBOUND = process.env.WORDPRESS_INBOUND_URL || '';
 const logger = pino({ level: process.env.LOG_LEVEL || 'warn' });
@@ -265,7 +267,10 @@ async function downloadAndStoreMedia(accountId, message) {
 function enqueueMediaDownload(accountId, message) {
   const id = String(message?.key?.id || '');
   if (!id || !mediaDescriptor(message)) return;
-  const key = `${accountId}:${id}`;
+  const rawKey = `${accountId}:${id}`;
+  rawMediaMessageCache.set(rawKey, message);
+  while (rawMediaMessageCache.size > 500) rawMediaMessageCache.delete(rawMediaMessageCache.keys().next().value);
+  const key = rawKey;
   if (mediaDownloadQueued.has(key) || mediaDownloadQueue.length >= 250) return;
   mediaDownloadQueued.add(key);
   mediaDownloadQueue.push({ accountId, message, key });
@@ -760,6 +765,32 @@ app.get('/api/accounts/:id/media/:messageId', authorized, (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   fs.createReadStream(file).on('error', err => { logger.warn({ accountId: req.params.id, error: err.message }, 'Unable to stream media'); if (!res.headersSent) res.status(500).end(); }).pipe(res);
 });
+app.post('/api/accounts/:id/media/:messageId/retry', authorized, asyncRoute(async (req, res) => {
+  const accountId = String(req.params.id || '');
+  const messageId = String(req.params.messageId || '');
+  if (!findMeta(accountId)) return res.status(404).json({ error: 'Conta não encontrada' });
+  if (!/^[A-Za-z0-9_-]{6,200}$/.test(messageId)) return res.status(400).json({ error: 'ID da mídia inválido.' });
+  const run = getAccount(accountId);
+  let entry = null;
+  for (const chat of run?.chats?.values?.() || []) {
+    entry = (chat.messages || []).find(m => String(m.id) === messageId) || entry;
+    if (entry) break;
+  }
+  const targetPath = mediaDiskPath(accountId, messageId);
+  if (entry?.mediaStored && fs.existsSync(targetPath)) return res.json({ ok: true, mediaStored: true, messageId, cached: true });
+  const raw = rawMediaMessageCache.get(`${accountId}:${messageId}`);
+  if (!raw) return res.status(409).json({ error: 'A mensagem original não está mais na memória do processo. Aguarde a sincronização do WhatsApp; o serviço só pode repetir downloads de mídias conhecidas pela sessão atual.' });
+  try {
+    await downloadAndStoreMedia(accountId, raw);
+    const foundPath = mediaDiskPath(accountId, messageId);
+    if (!fs.existsSync(foundPath)) return res.status(502).json({ error: 'O WhatsApp não disponibilizou o arquivo nesta tentativa. Tente novamente mais tarde.' });
+    return res.json({ ok: true, mediaStored: true, messageId, cached: false });
+  } catch (error) {
+    logger.warn({ accountId, messageId, code: error?.code || null, error: error?.message || String(error) }, 'Manual media retry failed');
+    return res.status(502).json({ error: 'Falha ao baixar a mídia do WhatsApp: ' + (error?.message || 'erro desconhecido') });
+  }
+}));
+
 app.post('/api/accounts/:id/media', authorized, asyncRoute(async (req, res) => {
   if (!findMeta(req.params.id)) return res.status(404).json({ error: 'Conta não encontrada' });
   res.json(await sendChatMedia(req.params.id, req.body?.jid, req.body || {}));

@@ -14,6 +14,7 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
+const SERVICE_VERSION = '2.2.0';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
 const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');
@@ -44,8 +45,15 @@ function proxyAgent(proxyUrl) {
   return proxyUrl.startsWith('socks') ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
 }
 function persistRegistry() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(registry, null, 2), { mode: 0o600 });
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tempFile = path.join(DATA_DIR, `.accounts-${process.pid}-${crypto.randomUUID()}.tmp`);
+    fs.writeFileSync(tempFile, JSON.stringify(registry, null, 2), { mode: 0o600 });
+    fs.renameSync(tempFile, ACCOUNTS_FILE);
+  } catch (e) {
+    logger.error({ code: e.code || null, error: e.message }, 'Unable to persist WhatsApp account registry');
+    throw new Error(`Não foi possível salvar as contas do WhatsApp. Verifique se DATA_DIR é gravável e persistente (erro ${e.code || 'filesystem'}).`);
+  }
 }
 function findMeta(id) { return registry.find(a => a.id === id); }
 function getAccount(id) {
@@ -190,8 +198,15 @@ async function startAccount(id) {
 async function createAccount(name) {
   const safeName = String(name || '').trim().slice(0, 80);
   if (!safeName) throw new Error('Informe um nome para a conta.');
+  if (registry.some(a => a.name.toLowerCase() === safeName.toLowerCase())) {
+    throw new Error('Já existe uma conta com esse nome. Escolha outro nome para identificá-la.');
+  }
   const meta = normalizeMeta({ id: crypto.randomUUID(), name: safeName, delayMin: 5, delayMax: 30, proxyUrl: '' });
-  registry.push(meta); persistRegistry(); getAccount(meta.id);
+  registry.push(meta);
+  try { persistRegistry(); }
+  catch (e) { registry = registry.filter(a => a.id !== meta.id); throw e; }
+  getAccount(meta.id);
+  logger.info({ accountId: meta.id, name: meta.name, accountCount: registry.length }, 'WhatsApp account record created');
   startAccount(meta.id).catch(err => logger.warn({ accountId: meta.id, err: err.message }, 'Account start failed'));
   return publicAccount(meta);
 }
@@ -223,10 +238,45 @@ function getDefaultAccount() {
   const connected = registry.find(a => getAccount(a.id).connected);
   return connected || registry[0] || null;
 }
-function asyncRoute(fn) { return (req, res) => Promise.resolve(fn(req, res)).catch(e => res.status(400).json({ error: e.message || 'Falha na solicitação' })); }
+function asyncRoute(fn) { return (req, res) => Promise.resolve(fn(req, res)).catch(e => { logger.error({ method: req.method, route: req.path, code: e.code || null, error: e.message || 'Falha na solicitação' }, 'API request failed'); res.status(400).json({ error: e.message || 'Falha na solicitação' }); }); }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', accounts: registry.length }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', serviceVersion: SERVICE_VERSION, accounts: registry.length }));
 app.get('/api/accounts', authorized, (_req, res) => res.json({ accounts: registry.map(publicAccount) }));
+app.get('/api/diagnostics', authorized, (_req, res) => {
+  function testWritable(dir) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, `.h2e-check-${process.pid}-${crypto.randomUUID()}`);
+      fs.writeFileSync(probe, 'ok', { mode: 0o600 });
+      fs.unlinkSync(probe);
+      return { ok: true, errorCode: null };
+    } catch (e) { return { ok: false, errorCode: e.code || 'UNKNOWN' }; }
+  }
+  let diskAccounts = null; let fileError = null;
+  try { const parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')); if (Array.isArray(parsed)) diskAccounts = parsed; else fileError = 'INVALID_FORMAT'; }
+  catch (e) { fileError = e.code || 'READ_ERROR'; }
+  const dataWritable = testWritable(DATA_DIR);
+  const sessionsWritable = testWritable(SESSIONS_ROOT);
+  const memoryIds = registry.map(a => a.id).sort();
+  const diskIds = Array.isArray(diskAccounts) ? diskAccounts.map(a => String(a.id)).sort() : [];
+  const storageConsistent = Array.isArray(diskAccounts) && JSON.stringify(memoryIds) === JSON.stringify(diskIds);
+  res.json({
+    ok: dataWritable.ok && sessionsWritable.ok && storageConsistent,
+    serviceVersion: SERVICE_VERSION,
+    nodeMajor: Number(process.versions.node.split('.')[0]),
+    memoryAccountCount: registry.length,
+    storedAccountCount: Array.isArray(diskAccounts) ? diskAccounts.length : null,
+    accountsFileExists: fs.existsSync(ACCOUNTS_FILE),
+    storageConsistent,
+    dataDirectoryWritable: dataWritable.ok,
+    dataDirectoryError: dataWritable.errorCode,
+    sessionsDirectoryWritable: sessionsWritable.ok,
+    sessionsDirectoryError: sessionsWritable.errorCode,
+    accountsFileError: fileError,
+    bridgeSecretConfigured: Boolean(SECRET),
+    wordpressCallbackConfigured: Boolean(WP_INBOUND)
+  });
+});
 app.post('/api/accounts', authorized, asyncRoute(async (req, res) => { const account = await createAccount(req.body?.name); res.status(201).json({ account }); }));
 app.get('/api/accounts/:id/status', authorized, (req, res) => {
   const meta = findMeta(req.params.id); if (!meta) return res.status(404).json({ error: 'Conta não encontrada' });
@@ -278,6 +328,6 @@ async function boot() {
     getAccount(meta.id);
     startAccount(meta.id).catch(err => logger.warn({ accountId:meta.id, err:err.message }, 'Initial account start failed'));
   }
-  app.listen(PORT, HOST, () => logger.info(`H2E multi-account bridge listening on ${HOST}:${PORT}`));
+  app.listen(PORT, HOST, () => logger.info({ serviceVersion: SERVICE_VERSION, nodeVersion: process.versions.node, accountCount: registry.length }, `H2E multi-account bridge listening on ${HOST}:${PORT}`));
 }
 boot().catch(err => { logger.error({ err:err.message }, 'Bridge startup failed'); process.exit(1); });

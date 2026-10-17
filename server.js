@@ -16,7 +16,7 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.6';
+const SERVICE_VERSION = '2.4.7';
 
 // Hostinger swaps hbuilds/current to a new version on every deployment. Any
 // relative storage path under the app working directory therefore risks pointing
@@ -437,11 +437,11 @@ function refreshRegistryFromDisk({ startNewConnections = false, reason = 'reques
   try { parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')); }
   catch (error) {
     logger.warn({ reason, code: error?.code || null, error: error?.message || String(error), accountsFile: ACCOUNTS_FILE }, 'Could not refresh account registry from disk');
-    return false;
+    return null;
   }
   if (!Array.isArray(parsed)) {
     logger.error({ reason, accountsFile: ACCOUNTS_FILE }, 'Persistent account registry is not an array');
-    return false;
+    return null;
   }
   const next = parsed.map(normalizeMeta);
   const currentJson = JSON.stringify(registry.map(normalizeMeta));
@@ -676,11 +676,21 @@ async function startAccount(id) {
   try { return await run.startPromise; } finally { if (!run.connected) run.startPromise = null; }
 }
 async function createAccount(name) {
-  refreshRegistryFromDisk({ reason: 'create-account' });
+  const refreshResult = refreshRegistryFromDisk({ reason: 'create-account' });
+  if (refreshResult === null) {
+    throw new Error('Não foi possível ler accounts.json. A criação foi interrompida para evitar inconsistência entre a lista e o cadastro de contas.');
+  }
   const safeName = String(name || '').trim().slice(0, 80);
   if (!safeName) throw new Error('Informe um nome para a conta.');
-  if (registry.some(a => a.name.toLowerCase() === safeName.toLowerCase())) {
-    throw new Error('Já existe uma conta com esse nome. Escolha outro nome para identificá-la.');
+  const nameKey = value => String(value || '').normalize('NFC').trim().toLocaleLowerCase('pt-BR');
+  const existing = registry.find(a => nameKey(a.name) === nameKey(safeName));
+  if (existing) {
+    const run = getAccount(existing.id);
+    if (run && !run.connected && !run.connecting && !run.qr && !run.startPromise) {
+      startAccount(existing.id).catch(error => logger.warn({ accountId: existing.id, error: error?.message || String(error) }, 'Could not restart existing account after duplicate create request'));
+    }
+    logger.warn({ accountId: existing.id, accountName: existing.name, processId: process.pid, accountsFile: ACCOUNTS_FILE, accountCount: registry.length }, 'Duplicate account-create request resolved to existing account');
+    return { ...publicAccount(existing), reused: true };
   }
   const meta = normalizeMeta({ id: crypto.randomUUID(), name: safeName, delayMin: 5, delayMax: 30, proxyUrl: '' });
   registry.push(meta);
@@ -692,7 +702,10 @@ async function createAccount(name) {
   return publicAccount(meta);
 }
 async function removeAccount(id) {
-  refreshRegistryFromDisk({ reason: `remove-account:${id}` });
+  const refreshResult = refreshRegistryFromDisk({ reason: `remove-account:${id}` });
+  if (refreshResult === null) {
+    throw new Error('Não foi possível ler accounts.json. A remoção foi interrompida para evitar inconsistência no registro de contas.');
+  }
   const meta = findMeta(id);
   if (!meta) throw new Error('Conta não encontrada.');
   const run = getAccount(id);
@@ -830,9 +843,21 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', serviceVersion: SERVICE_VERSION, accounts: registry.length });
 });
 app.get('/api/accounts', authorized, (_req, res) => {
-  refreshRegistryFromDisk({ startNewConnections: true, reason: 'list-accounts' });
+  const refreshResult = refreshRegistryFromDisk({ startNewConnections: true, reason: 'list-accounts' });
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.json({ accounts: registry.map(publicAccount) });
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('X-H2E-Process-Id', String(process.pid));
+  res.setHeader('X-H2E-Account-Count', String(registry.length));
+  if (refreshResult === null) {
+    logger.error({ processId: process.pid, accountCount: registry.length, accountsFile: ACCOUNTS_FILE }, 'Account list failed because the persistent registry could not be read');
+    return res.status(503).json({
+      error: 'Não foi possível ler accounts.json. O serviço não pode confirmar a lista de contas.',
+      serviceVersion: SERVICE_VERSION,
+      processId: process.pid
+    });
+  }
+  logger.info({ processId: process.pid, accountCount: registry.length, accountIds: registry.map(account => account.id), accountsFile: ACCOUNTS_FILE }, 'Account list served');
+  res.json({ accounts: registry.map(publicAccount), serviceVersion: SERVICE_VERSION, processId: process.pid, accountCount: registry.length });
 });
 app.get('/api/diagnostics', authorized, (_req, res) => {
   function findBaileysCompanionRefreshHandler(dir) {
@@ -899,7 +924,13 @@ app.get('/api/diagnostics', authorized, (_req, res) => {
     wordpressCallbackConfigured: Boolean(WP_INBOUND)
   });
 });
-app.post('/api/accounts', authorized, asyncRoute(async (req, res) => { const account = await createAccount(req.body?.name); res.status(201).json({ account }); }));
+app.post('/api/accounts', authorized, asyncRoute(async (req, res) => {
+  const account = await createAccount(req.body?.name);
+  const reused = account.reused === true;
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-H2E-Process-Id', String(process.pid));
+  res.status(reused ? 200 : 201).json({ account, reused, serviceVersion: SERVICE_VERSION, processId: process.pid });
+}));
 app.get('/api/accounts/:id/chats', authorized, (req, res) => {
   if (!findMeta(req.params.id)) return res.status(404).json({ error: 'Conta não encontrada' });
   const chats = listChats(req.params.id);

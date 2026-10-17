@@ -16,7 +16,7 @@ app.use(express.json({ limit: '28mb' }));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.BRIDGE_SECRET || '';
-const SERVICE_VERSION = '2.4.4';
+const SERVICE_VERSION = '2.4.5';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || './h2e-whatsapp-data');
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR || path.join(DATA_DIR, 'sessions'));
 const LEGACY_AUTH_DIR = path.resolve(process.env.AUTH_DIR || './auth_info');
@@ -696,6 +696,42 @@ function getDefaultAccount() {
 }
 function asyncRoute(fn) { return (req, res) => Promise.resolve(fn(req, res)).catch(e => { logger.error({ method: req.method, route: req.path, code: e.code || null, error: e.message || 'Falha na solicitação' }, 'API request failed'); res.status(400).json({ error: e.message || 'Falha na solicitação' }); }); }
 
+// Compatibility for requests routed to a process whose in-memory registry is
+// stale, plus legacy WordPress pages using the hard-coded ID "principal".
+// First refresh the registry from the persistent accounts.json when the request
+// ID is missing locally; then resolve the alias only if there is one unambiguous
+// account. Never guess between multiple accounts or overwrite a real ID.
+function refreshRegistryForRequestedId(requestedId) {
+  if (registry.some(account => account.id === requestedId)) return;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    if (!Array.isArray(parsed)) return;
+    const diskRegistry = parsed.map(normalizeMeta);
+    const diskHasRequestedId = diskRegistry.some(account => account.id === requestedId);
+    if (diskHasRequestedId || registry.length === 0) {
+      registry = diskRegistry;
+      for (const meta of registry) getAccount(meta.id);
+      logger.warn({ requestedAccountId: requestedId, memoryAccountCount: registry.length }, 'Account registry refreshed from persistent storage');
+    }
+  } catch (error) {
+    logger.warn({ requestedAccountId: requestedId, code: error?.code || null, error: error?.message || String(error) }, 'Could not refresh account registry from persistent storage');
+  }
+}
+app.use((req, _res, next) => {
+  const match = req.url.match(/^\/api\/accounts\/([^/?]+)/);
+  if (!match) return next();
+  let requestedId = '';
+  try { requestedId = decodeURIComponent(match[1]); } catch (_) { return next(); }
+  refreshRegistryForRequestedId(requestedId);
+  const hasRealPrincipal = registry.some(account => account.id === 'principal');
+  if (requestedId === 'principal' && !hasRealPrincipal && registry.length === 1) {
+    const canonicalId = registry[0].id;
+    req.url = req.url.replace(/^\/api\/accounts\/[^/?]+/, `/api/accounts/${encodeURIComponent(canonicalId)}`);
+    logger.warn({ requestedAccountId: 'principal', resolvedAccountId: canonicalId, accountName: registry[0].name }, 'Legacy principal account alias resolved to the only registered account');
+  }
+  next();
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'H2E CRM WhatsApp Web Bridge', serviceVersion: SERVICE_VERSION, accounts: registry.length }));
 app.get('/api/accounts', authorized, (_req, res) => res.json({ accounts: registry.map(publicAccount) }));
 app.get('/api/diagnostics', authorized, (_req, res) => {
@@ -740,6 +776,8 @@ app.get('/api/diagnostics', authorized, (_req, res) => {
     nodeMajor: Number(process.versions.node.split('.')[0]),
     memoryAccountCount: registry.length,
     storedAccountCount: Array.isArray(diskAccounts) ? diskAccounts.length : null,
+    accountRecords: registry.map(account => ({ id: account.id, name: account.name })),
+    legacyPrincipalAliasWillResolve: !registry.some(account => account.id === 'principal') && registry.length === 1,
     accountsFileExists: fs.existsSync(ACCOUNTS_FILE),
     storageConsistent,
     dataDirectoryWritable: dataWritable.ok,
